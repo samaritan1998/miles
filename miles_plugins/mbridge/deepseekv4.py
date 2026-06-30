@@ -91,8 +91,18 @@ class DeepseekV4Bridge(DeepseekV3Bridge):
                 self.dtype = saved_dtype
         return super()._weight_to_mcore_format(mcore_weights_name, hf_weights)
 
+    def _get_rope_theta(self):
+        rope_theta = getattr(self.hf_config, "rope_theta", None)
+        if rope_theta is None:
+            rope_scaling = getattr(self.hf_config, "rope_scaling", None)
+            if isinstance(rope_scaling, dict):
+                rope_theta = rope_scaling.get("rope_theta")
+        if rope_theta is None:
+            raise ValueError("DeepSeek V4 rope config must contain rope_theta")
+        return float(rope_theta)
+
     def _build_config(self):
-        self.hf_config.rope_theta = self.hf_config.rope_scaling["rope_theta"]
+        self.hf_config.rope_theta = self._get_rope_theta()
         config = super()._build_config()
 
         config.attention_backend = AttnBackend.auto

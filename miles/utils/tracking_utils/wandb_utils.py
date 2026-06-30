@@ -25,6 +25,10 @@ def _wandb_settings(**kwargs):
     return wandb.Settings(init_timeout=300.0, **kwargs)
 
 
+def _wandb_login_key(args):
+    return args.wandb_key or os.environ.get("WANDB_API_KEY")
+
+
 def init_wandb_primary(args):
     if not args.use_wandb:
         args.wandb_run_id = None
@@ -43,8 +47,8 @@ def init_wandb_primary(args):
     offline = _is_offline_mode(args)
 
     # Only perform explicit login when NOT offline
-    if (not offline) and args.wandb_key is not None:
-        wandb.login(key=args.wandb_key, host=args.wandb_host)
+    if (not offline) and (key := _wandb_login_key(args)):
+        wandb.login(key=key, host=args.wandb_host)
 
     # Prepare wandb init parameters
     # add random 6 length string with characters
@@ -113,8 +117,8 @@ def init_wandb_secondary(args, router_addr=None):
 
     offline = _is_offline_mode(args)
 
-    if (not offline) and args.wandb_key is not None:
-        wandb.login(key=args.wandb_key, host=args.wandb_host)
+    if (not offline) and (key := _wandb_login_key(args)):
+        wandb.login(key=key, host=args.wandb_host)
 
     # Configure settings based on offline/online mode
     if offline:
