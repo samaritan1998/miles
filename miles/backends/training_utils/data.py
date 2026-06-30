@@ -1,4 +1,5 @@
 import logging
+import os
 from argparse import Namespace
 from collections.abc import Sequence
 
@@ -17,6 +18,21 @@ from .mm_data import expand_multimodal_rollout_data_in_place
 from .parallel import get_parallel_state
 
 logger = logging.getLogger(__name__)
+_LOGGED_BSHD_MICROBATCH_MAX = False
+
+
+def get_bshd_max_seqlen(total_lengths: Sequence[int], pad_multiplier: int, compress_ratios: Sequence[int] | None) -> int:
+    """Return the padded BSHD max sequence length for one micro-batch."""
+    parallel_state = get_parallel_state()
+    max_seq_len = max(total_lengths)
+
+    pad_size = parallel_state.tp.size * pad_multiplier
+    max_compress_ratio = max(compress_ratios) if compress_ratios else 0
+    if max_compress_ratio:
+        local_seqlen_multiple = max_compress_ratio * (2 if parallel_state.cp.size > 1 else 1)
+        pad_size = max(pad_size, local_seqlen_multiple * parallel_state.cp.size)
+
+    return (max_seq_len + pad_size - 1) // pad_size * pad_size
 
 
 def _rollout_logprob_dtype(args: Namespace) -> torch.dtype:
@@ -57,18 +73,16 @@ def get_rollout_data(args: Namespace, rollout_data_ref: Box) -> RolloutBatch:
         ]
 
     if args.qkv_format == "bshd":
-        # TODO: micro-batch wise dynamic, possibly move to @data.py:get_data_iterator
-        max_seq_len = max(rollout_data["total_lengths"])
-
-        # pad to reduce memory fragmentation and maybe make the computation faster
-        pad_size = parallel_state.tp.size * args.data_pad_size_multiplier
-        max_compress_ratio = max(args.compress_ratios) if args.compress_ratios else 0
-        if max_compress_ratio:
-            local_seqlen_multiple = max_compress_ratio * (2 if parallel_state.cp.size > 1 else 1)
-            pad_size = max(pad_size, local_seqlen_multiple * parallel_state.cp.size)
-        max_seq_len = (max_seq_len + pad_size - 1) // pad_size * pad_size
-
-        rollout_data["max_seq_lens"] = [max_seq_len] * len(rollout_data["tokens"])
+        per_sample_max_seq_lens = [
+            get_bshd_max_seqlen([total_length], args.data_pad_size_multiplier, args.compress_ratios)
+            for total_length in rollout_data["total_lengths"]
+        ]
+        use_microbatch_padding = os.environ.get("MILES_BSHD_MICROBATCH_PADDING", "0") == "1"
+        if use_microbatch_padding:
+            rollout_data["max_seq_lens"] = per_sample_max_seq_lens
+        else:
+            rollout_max_seqlen = max(per_sample_max_seq_lens)
+            rollout_data["max_seq_lens"] = [rollout_max_seqlen] * len(rollout_data["tokens"])
 
     if "rollout_log_probs" in rollout_data:
         rollout_logprob_dtype = _rollout_logprob_dtype(args)
@@ -130,6 +144,7 @@ def get_batch(
     """
 
     parallel_state = get_parallel_state()
+    global _LOGGED_BSHD_MICROBATCH_MAX
 
     assert "tokens" in keys
     batch = data_iterator.get_next(keys)
@@ -151,8 +166,20 @@ def get_batch(
     cp_size = parallel_state.cp.size
 
     if qkv_format == "bshd":
-        max_seqlen = batch["max_seq_lens"][0]
+        rollout_max_seqlen = max(data_iterator.rollout_data["max_seq_lens"])
+        use_microbatch_padding = os.environ.get("MILES_BSHD_MICROBATCH_PADDING", "0") == "1"
+        max_seqlen = max(batch["max_seq_lens"]) if use_microbatch_padding else rollout_max_seqlen
         assert max([t.size(0) for t in tokens]) <= max_seqlen
+        batch["max_seq_lens"] = [max_seqlen] * len(tokens)
+        if use_microbatch_padding and not _LOGGED_BSHD_MICROBATCH_MAX:
+            logger.info(
+                "BSHD microbatch-wise padding enabled: rollout_max_seqlen=%s, microbatch_max_seqlen=%s, "
+                "microbatch_total_lengths=%s",
+                rollout_max_seqlen,
+                max_seqlen,
+                batch["total_lengths"],
+            )
+            _LOGGED_BSHD_MICROBATCH_MAX = True
         if allgather_cp:
             assert max_seqlen % cp_size == 0, f"max_seqlen {max_seqlen} not divisible by cp_size {cp_size}"
             local_len = max_seqlen // cp_size
